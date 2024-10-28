@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudWatch Event Rule with Filters for all Compliance Checks
+
+Parameters:
+  TgwAccount:
+    Type: String
+    Description: AccountId of Target Account
+
+Conditions:
+  IsNotTGWAccount: !Not [!Equals [!Ref "AWS::AccountId" , !Ref TgwAccount]]
+
+Resources:
+  TGWAttachAutoAcceptRule:
+    Type: "AWS::Events::Rule"
+    Condition: IsNotTGWAccount
+    Properties: 
+      Description: CloudWatch Event Rule for automatically accepting TGW Attachments
+      EventPattern: {
+        "source": [ 
+          "aws.ec2"
+        ], 
+        "detail-type": [ 
+          "AWS API Call via CloudTrail" 
+        ], 
+        "detail": { 
+          "eventSource": [ 
+            "ec2.amazonaws.com" 
+          ], 
+          "eventName": [
+            "CreateTransitGatewayVpcAttachment"
+          ] 
+        } 
+      } 
+      Name: "RuleForTGWAttachAutoAccept"
+      Targets: 
+        - Arn: !Sub "arn:aws:events:${AWS::Region}:${TgwAccount}:event-bus/default"
+          Id: "TGWAttachAutoAcceptRule"
+          RoleArn: !GetAtt TGWAttachAutoAcceptRole.Arn
+
+  TGWAttachAutoAcceptRole: 
+    Type: "AWS::IAM::Role"
+    Condition: IsNotTGWAccount
+    Properties: 
+      RoleName: "tgw-attach-auto-accept-event-fwd-role"
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "events.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+
+  TGWAttachAutoAcceptRolePolicy: 
+    Type: "AWS::IAM::Policy"
+    Condition: IsNotTGWAccount
+    Properties: 
+      PolicyName: "tgw-attach-auto-accept-event-fwd-policy"
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: "events:PutEvents"
+            Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+      Roles: 
+        - Ref: "TGWAttachAutoAcceptRole"
+
+
+  CrossAccountLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CrossAccountLambdaRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${TgwAccount}:root'
+            Action:
+              - sts:AssumeRole
+      MaxSessionDuration: 3600
+      Path: /
+      Policies:
+        - PolicyName: CrossAccountLambdaRolePolicy
+          PolicyDocument: 
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: 'arn:aws:iam::*:role/*'

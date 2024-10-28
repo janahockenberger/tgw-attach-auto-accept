@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Automatically accepts Transit Gateway Attachments for allowed CIDR and Account pairs
+
+
+Resources:
+  # Automated Association
+  CloudWatchRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: "Accepts the TGW Attachment and sets a Route in the Route Table to OnP-remise"
+      State: ENABLED
+      EventPattern: {
+        "source": [
+          "aws.ec2"
+        ],
+        "detail-type": [
+          "AWS API Call via CloudTrail"
+        ],
+        "detail": {
+          "eventSource": [
+            "ec2.amazonaws.com"
+          ],
+          "eventName": [
+            "CreateTransitGatewayVpcAttachment"
+          ]
+        }
+      }
+      Name: TGWAcceptAutoAttach
+      Targets:
+      - Arn: !GetAtt LambdaFunction.Arn
+        Id: LambdaFunction
+
+
+  DynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: 'TGWAttachmentAcceptedCIDR'
+      AttributeDefinitions:
+        - AttributeName: 'cidr_block'
+          AttributeType: 'S'
+        - AttributeName: 'account_id'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'cidr_block'
+          KeyType: 'HASH'  
+        - AttributeName: 'account_id'
+          KeyType: 'RANGE' 
+      BillingMode: PAY_PER_REQUEST
+
+
+  TableInitializer:
+    Type: Custom::DynamoDBTableInitializer
+    Properties: 
+      ServiceToken: !GetAtt TableInitializerFunction.Arn
+      TableName: !Ref DynamoDBTable
+      TableItems:
+        - cidr_block: "1.2.3.4/5"
+          account_id: "123456789012"
+        - cidr_block: "6.7.8.9/12"
+          account_id: "234567890123"
+        ### more entries can be added here
+
+  TableInitializerFunction:
+    Type: AWS::Lambda::Function
+    Properties: 
+      FunctionName: dynamodb-table-initializer
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  table_name = event['ResourceProperties']['TableName']
+                  items = event['ResourceProperties']['TableItems']
+                  
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(table_name)
+
+                  for item in items:
+                      table.put_item(Item=item)
+                  
+                  response_data = {'Status': 'Success'}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  response_data = {'Status': str(e)}
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+      Handler: 'index.lambda_handler'
+      Runtime: python3.11
+      Role: !GetAtt TableInitializerFunctionRole.Arn
+
+  TableInitializerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'DynamoDBAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: 'dynamodb:PutItem'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - Fn::Sub: 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tgw-attach-auto-accept-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: tgw-attach-auto-accept-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - Fn::Sub: 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: arn:aws:iam::*:role/CrossAccountLambdaRole
+              - Effect: Allow
+                Action:
+                  - ec2:AcceptTransitGatewayVpcAttachment
+                  - ec2:DescribeVpcs
+                  - dynamodb:Query
+                Resource: "*"
+
+
+  LambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: tgw-attach-auto-accept-function
+      Description: Accepts a TGW Attachment when matched with a defined list of CIDR and Account pairs
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      MemorySize: 128
+      Timeout: 900
+      Runtime: "python3.11"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          from botocore.exceptions import ClientError
+
+          DYNAMODBTABLE=os.environ['DynamoDBTable']
+
+
+          def lambda_handler(event, context):
+              print(event)
+              try:
+                  cleanedEvent = json.loads(event)
+              except:
+                  cleanedEvent = event
+              print(f'CleanedEvent: {cleanedEvent}')
+              if cleanedEvent["detail-type"] == "AWS API Call via CloudTrail" :
+                  print('API Call')
+                  handle_called_event(cleanedEvent, context)
+                      
+                      
+          def handle_called_event(event, context):
+              eventName = event['detail']['eventName']
+              print(f'EventName: {eventName}')
+              if eventName == 'CreateTransitGatewayVpcAttachment':
+                  handle_new_tgw_attachment(event, context)
+              else:
+                  print(f'Unexpected EventName {eventName}.')
+
+          def handle_new_tgw_attachment(event, context):
+              print(event)
+              account_id=str(event['detail']['responseElements']['CreateTransitGatewayVpcAttachmentResponse']['transitGatewayVpcAttachment']['vpcOwnerId'])
+              vpc_id=str(event['detail']['responseElements']['CreateTransitGatewayVpcAttachmentResponse']['transitGatewayVpcAttachment']['vpcId'])
+              attachment_id=str(event['detail']['responseElements']['CreateTransitGatewayVpcAttachmentResponse']['transitGatewayVpcAttachment']['transitGatewayAttachmentId'])
+              roleName = os.environ['LambdaRole']
+              ec2_client = get_session(account_id, 'eu-central-1', roleName).client('ec2')
+              vpc_info = ec2_client.describe_vpcs(VpcIds=[vpc_id])
+              cidr_block = vpc_info['Vpcs'][0]['CidrBlock']
+
+              
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(DYNAMODBTABLE)
+              try:
+                  response = table.query(
+                      KeyConditionExpression=boto3.dynamodb.conditions.Key('account_id').eq(account_id) & 
+                                            boto3.dynamodb.conditions.Key('cidr_block').eq(cidr_block)
+                  )
+
+                  if response.get('Items'):
+                      print(f'Found entry for AccountID {account_id} and CIDR {cidr_block}.')
+                      accept_tgw_attachment(attachment_id)
+                  else:
+                      print(f'No entry found for AccountID {account_id} and CIDR {cidr_block}.')
+
+              except Exception as e:
+                  print(f"Error: {e}")
+
+
+          def accept_tgw_attachment(attachment_id):
+              ec2_client=boto3.client('ec2')
+              try:
+                  ec2_client.accept_transit_gateway_vpc_attachment(TransitGatewayAttachmentId=attachment_id)
+                  print(f"TGW Attachment {attachment_id} has been accepted.")
+              except ClientError as e:
+                  print(f'Error: {e}')
+
+          def get_session(accountId, region, roleName):
+              sts_client = boto3.client('sts')
+              assumed_role_object = sts_client.assume_role(
+                  RoleSessionName='xyz', RoleArn=f'arn:aws:iam::{accountId}:role/{roleName}')
+              credentials = assumed_role_object['Credentials']
+              access_key_id = credentials['AccessKeyId']
+              secret_access_key = credentials['SecretAccessKey']
+              session_token = credentials['SessionToken']
+              new_session = boto3.Session(
+                  aws_access_key_id=access_key_id,
+                  aws_secret_access_key=secret_access_key,
+                  aws_session_token=session_token,
+                  region_name=region
+              )
+              return new_session
+      Environment:
+        Variables:
+          LambdaRole: CrossAccountLambdaRole
+          DynamoDBTable: !Ref DynamoDBTable
+
+
+  LambdaFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt   LambdaFunction.Arn
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt CloudWatchRule.Arn
